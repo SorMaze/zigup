@@ -5,3 +5,4 @@
 *.obj
 *.exe
 /tests/__pycache__/
+/.workbuddy/
