@@ -68,7 +68,7 @@ function Copy-FileAtomically([string]$Source, [string]$Destination) {
     }
 }
 
-function Open-ExclusiveFileLock([string]$Path) {
+function Open-ExclusiveFileLock([string]$Path, [switch]$NoWait) {
     $stream = [System.IO.File]::Open(
         $Path,
         [System.IO.FileMode]::OpenOrCreate,
@@ -82,6 +82,7 @@ function Open-ExclusiveFileLock([string]$Path) {
                 return $stream
             }
             catch [System.IO.IOException] {
+                if ($NoWait) { throw }
                 Start-Sleep -Milliseconds 50
             }
         }
@@ -268,6 +269,14 @@ function Install-Release(
     $asset = Get-ReleaseAsset $Release $PlatformKey
     $url = [string]$asset.tarball
     $expectedHash = [string]$asset.shasum
+    # The index publishes the exact archive size, so the progress line needs no
+    # extra HEAD request against the download host.
+    $totalBytes = 0L
+    $sizeProperty = $asset.PSObject.Properties['size']
+    if ($null -ne $sizeProperty) {
+        $parsedSize = 0L
+        if ([long]::TryParse([string]$sizeProperty.Value, [ref]$parsedSize)) { $totalBytes = $parsedSize }
+    }
 
     if (-not $url.StartsWith('https://ziglang.org/', [System.StringComparison]::OrdinalIgnoreCase)) {
         throw 'refusing a non-official Zig download URL'
@@ -287,7 +296,7 @@ function Install-Release(
     $archive = Join-Path $DownloadsDir $archiveName
     if (-not (Test-ArchiveHash $archive $expectedHash)) {
         Write-Status "downloading $Channel $version"
-        Invoke-ZigupDownload -Url $url -Destination $archive -ExpectedHash $expectedHash
+        Invoke-ZigupDownload -Url $url -Destination $archive -ExpectedHash $expectedHash -TotalBytes $totalBytes
     }
 
     Write-Status "verifying $Channel $version SHA-256"
@@ -473,12 +482,7 @@ New-Item -ItemType Directory -Force -Path $binDir, $versionsDir, $downloadsDir, 
 
 $lockPath = Join-Path $ZigupHome 'update.lock'
 try {
-    $updateLock = [System.IO.File]::Open(
-        $lockPath,
-        [System.IO.FileMode]::OpenOrCreate,
-        [System.IO.FileAccess]::ReadWrite,
-        [System.IO.FileShare]::None
-    )
+    $updateLock = Open-ExclusiveFileLock $lockPath -NoWait
 }
 catch [System.IO.IOException] {
     throw "cannot acquire the update lock; another zigup update may already be running: $lockPath"

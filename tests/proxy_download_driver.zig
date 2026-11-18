@@ -13,7 +13,7 @@ pub fn main(init: std.process.Init) !void {
     var session = try proxy.Session.init(allocator, init.io, init.environ_map);
     var index: usize = 3;
     while (index < args.len) : (index += 2) {
-        session.download(tool, args[index], args[index + 1]) catch |err| {
+        session.download(tool, args[index], args[index + 1], .{}) catch |err| {
             var buffer: [512]u8 = undefined;
             var writer: std.Io.File.Writer = .init(.stderr(), init.io, &buffer);
             try writer.interface.print("proxy-test: {s}\n", .{@errorName(err)});

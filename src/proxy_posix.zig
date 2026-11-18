@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+const Progress = @import("progress.zig");
 
 pub const DownloadTool = struct {
     kind: enum { curl, wget },
@@ -30,6 +31,7 @@ pub const Session = struct {
     preferred: ?Route = null,
     preferred_plan: ?[32]u8 = null,
     current_plan: [32]u8 = undefined,
+    progress_enabled: bool = false,
 
     /// The caller normally supplies its update-lifetime arena allocator.
     pub fn init(allocator: Allocator, io: Io, environ: *const std.process.Environ.Map) !Session {
@@ -39,6 +41,7 @@ pub const Session = struct {
             .environ = environ,
             .mode = try parseMode(allocator, environ.get("ZIGUP_PROXY")),
             .no_proxy = firstNonEmpty(environ, &.{ "no_proxy", "NO_PROXY" }) orelse "",
+            .progress_enabled = Progress.allowed(io, environ),
         };
         if (session.mode == .auto and builtin.os.tag == .linux) {
             session.resolver_path = try session.findExecutable("proxy");
@@ -136,7 +139,13 @@ pub const Session = struct {
         return routes.toOwnedSlice(allocator);
     }
 
-    pub fn download(self: *Session, tool: DownloadTool, url: []const u8, output_path: []const u8) !void {
+    pub fn download(
+        self: *Session,
+        tool: DownloadTool,
+        url: []const u8,
+        output_path: []const u8,
+        options: Progress.Options,
+    ) !void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
@@ -161,7 +170,7 @@ pub const Session = struct {
             var attempt_file = try Io.Dir.cwd().createFile(self.io, temporary, .{ .truncate = true });
             attempt_file.close(self.io);
             try status(self.io, "download route: {s}", .{routeLabel(route)});
-            self.tryDownload(allocator, tool, route, url, temporary) catch |err| {
+            self.tryDownload(allocator, tool, route, url, temporary, options) catch |err| {
                 if (err != error.DownloadFailed) return err;
                 // Downloader error output can include proxy authentication.
                 // Report only the route type; never echo the raw proxy URL.
@@ -180,7 +189,15 @@ pub const Session = struct {
         return error.DownloadFailed;
     }
 
-    fn tryDownload(self: *Session, allocator: Allocator, tool: DownloadTool, route: Route, url: []const u8, output: []const u8) !void {
+    fn tryDownload(
+        self: *Session,
+        allocator: Allocator,
+        tool: DownloadTool,
+        route: Route,
+        url: []const u8,
+        output: []const u8,
+        options: Progress.Options,
+    ) !void {
         var child_env = try cleanEnvironment(allocator, self.environ);
         defer child_env.deinit();
         if (route.proxy) |proxy| {
@@ -207,26 +224,44 @@ pub const Session = struct {
                 url,
             },
         };
-        const result = std.process.run(allocator, self.io, .{
+        // Downloader diagnostics can carry proxy credentials, so both pipes are
+        // discarded instead of forwarded to the terminal. Progress is measured
+        // from the growing transfer file instead of parsed from that output.
+        var child = try std.process.spawn(self.io, .{
             .argv = argv,
             .environ_map = &child_env,
-            .stdout_limit = .limited(32768),
-            .stderr_limit = .limited(32768),
-            .timeout = deadline(self.io, 620),
-        }) catch |err| switch (err) {
-            error.Timeout => return error.DownloadFailed,
-            else => return err,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        });
+        var finished = std.atomic.Value(bool).init(false);
+        var timed_out = std.atomic.Value(bool).init(false);
+        var group: Io.Group = .init;
+        const supervised = watch: {
+            group.concurrent(self.io, superviseTransfer, .{
+                self.io,
+                &child,
+                output,
+                options,
+                self.progress_enabled,
+                &finished,
+                &timed_out,
+            }) catch break :watch false;
+            break :watch true;
         };
-        switch (result.term) {
-            .exited => |code| {
-                if (code == 0) return;
-                // Disk-write and invocation errors are not a proxy outage.
-                if ((tool.kind == .curl and (code == 2 or code == 23 or code == 26 or code == 27)) or
-                    (tool.kind == .wget and (code == 2 or code == 3))) return error.DownloadLocalFailure;
-                return error.DownloadFailed;
-            },
-            else => return error.DownloadInterrupted,
+        if (!supervised) {
+            // No looper available: the transfer still completes, just unobserved.
+            const term = child.wait(self.io) catch return error.DownloadInterrupted;
+            return transferError(tool, term);
         }
+        const term = child.wait(self.io) catch |err| {
+            finished.store(true, .release);
+            group.await(self.io) catch {};
+            return err;
+        };
+        finished.store(true, .release);
+        group.await(self.io) catch {};
+        if (timed_out.load(.acquire)) return error.DownloadFailed;
+        return transferError(tool, term);
     }
 
     fn findExecutable(self: *Session, name: []const u8) !?[]const u8 {
@@ -600,6 +635,65 @@ fn routeLabel(route: Route) []const u8 {
         .explicit => "explicit proxy",
     };
 }
+/// Overall transfer limit, matching the previous `std.process.run` deadline
+/// (curl stops itself at `--max-time 600`; wget has only phase timeouts).
+const transfer_timeout_ns: i96 = 620 * std.time.ns_per_s;
+const progress_interval_ns: i96 = 120 * std.time.ns_per_ms;
+
+/// Renders the single progress line while a downloader child is running and
+/// enforces the overall deadline. Runs on the looper thread; the caller keeps
+/// ownership of `child` and of the terminal between `status` messages.
+fn superviseTransfer(
+    io: Io,
+    child: *std.process.Child,
+    path: []const u8,
+    options: Progress.Options,
+    enabled: bool,
+    finished: *const std.atomic.Value(bool),
+    timed_out: *std.atomic.Value(bool),
+) void {
+    const started = Io.Timestamp.now(io, .awake);
+    var line_buffer: [192]u8 = undefined;
+    var writer_buffer: [512]u8 = undefined;
+    var file_writer: Io.File.Writer = .init(.stdout(), io, &writer_buffer);
+    const writer = &file_writer.interface;
+    var drawn: usize = 0;
+    var last_written: u64 = std.math.maxInt(u64);
+
+    while (!finished.load(.acquire)) {
+        const now = Io.Timestamp.now(io, .awake);
+        const elapsed = started.durationTo(now).nanoseconds;
+        if (elapsed >= transfer_timeout_ns) {
+            timed_out.store(true, .release);
+            child.kill(io);
+            break;
+        }
+        if (enabled) {
+            const written = Progress.sizeOf(io, path);
+            if (written != last_written) {
+                Progress.draw(writer, &line_buffer, written, options.total, elapsed, &drawn) catch {};
+                last_written = written;
+            }
+        }
+        io.sleep(Io.Duration.fromNanoseconds(@min(progress_interval_ns, transfer_timeout_ns - elapsed)), .awake) catch break;
+    }
+    if (enabled) Progress.erase(writer, &drawn);
+}
+
+/// Maps a downloader exit status onto the updater's error set. Disk-write and
+/// invocation failures must not be retried as if they were proxy outages.
+fn transferError(tool: DownloadTool, term: std.process.Child.Term) !void {
+    switch (term) {
+        .exited => |code| {
+            if (code == 0) return;
+            if ((tool.kind == .curl and (code == 2 or code == 23 or code == 26 or code == 27)) or
+                (tool.kind == .wget and (code == 2 or code == 3))) return error.DownloadLocalFailure;
+            return error.DownloadFailed;
+        },
+        else => return error.DownloadInterrupted,
+    }
+}
+
 fn deadline(io: Io, seconds: i64) Io.Timeout {
     return (Io.Timeout{ .duration = .{ .raw = .fromSeconds(seconds), .clock = .awake } }).toDeadline(io);
 }

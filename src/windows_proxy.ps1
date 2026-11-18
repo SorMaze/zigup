@@ -330,7 +330,33 @@ function ConvertTo-ZigupCurlConfigValue([string]$Value) {
     return '"' + $Value.Replace('\', '\\').Replace('"', '\"').Replace("`t", '\t') + '"'
 }
 
-function Invoke-ZigupCurl([string]$Url, [string]$Destination, $Route) {
+function Test-ZigupProgressEnabled {
+    $value = $env:ZIGUP_NO_PROGRESS
+    if (-not [string]::IsNullOrWhiteSpace($value)) {
+        if ($value.Trim() -notin @('0', 'false', 'no', 'off')) { return $false }
+    }
+    try { return -not [Console]::IsOutputRedirected }
+    catch { return $false }
+}
+
+function Format-ZigupProgressLine([long]$Written, [long]$TotalBytes, [double]$Seconds) {
+    if ($Seconds -le 0) { $Seconds = 0.001 }
+    $mib = 1048576.0
+    $done = $Written / $mib
+    $rate = $done / $Seconds
+    if ($TotalBytes -le 0) {
+        return ('  {0:0.0} MiB  {1:0.0} MiB/s' -f $done, $rate)
+    }
+    $percent = if ($Written -ge $TotalBytes) { 100 } else { [int][Math]::Floor($Written * 100 / $TotalBytes) }
+    $width = 24
+    $filled = [int][Math]::Floor($percent * $width / 100)
+    $bar = '=' * $filled
+    if ($percent -lt 100 -and $filled -lt $width) { $bar += '>' }
+    $bar = $bar.PadRight($width, '-')
+    return ('{0,3}% [{1}] {2:0.0}/{3:0.0} MiB {4:0.0} MiB/s' -f $percent, $bar, $done, ($TotalBytes / $mib), $rate)
+}
+
+function Invoke-ZigupCurl([string]$Url, [string]$Destination, $Route, [long]$TotalBytes = 0) {
     $systemCurl = Join-Path $env:SystemRoot 'System32\curl.exe'
     if (-not [IO.File]::Exists($systemCurl)) {
         $systemCurl = (Get-Command curl.exe -CommandType Application -ErrorAction Stop).Source
@@ -356,6 +382,7 @@ function Invoke-ZigupCurl([string]$Url, [string]$Destination, $Route) {
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $start
     $started = $false
+    $drawn = 0
     try {
         $savedInputEncoding = $null
         try {
@@ -385,10 +412,33 @@ function Invoke-ZigupCurl([string]$Url, [string]$Destination, $Route) {
         $inputPipe = $process.StandardInput.BaseStream
         $inputPipe.Write($inputBytes, 0, $inputBytes.Length)
         $inputPipe.Close()
-        if (-not $process.WaitForExit(925000)) {
-            $process.Kill()
-            $process.WaitForExit()
-            return 28
+        # Poll instead of one long wait so the transfer can report progress and
+        # still honour the same overall deadline as before.
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        $showProgress = Test-ZigupProgressEnabled
+        $lastBytes = -1L
+        while (-not $process.WaitForExit(200)) {
+            if ($showProgress) {
+                $file = [IO.FileInfo]::new($Destination)
+                if ($file.Exists) {
+                    try {
+                        $bytes = $file.Length
+                        if ($bytes -ne $lastBytes) {
+                            $line = Format-ZigupProgressLine $bytes $TotalBytes $clock.Elapsed.TotalSeconds
+                            $line = $line.Substring(0, [Math]::Min($line.Length, [Math]::Max(0, [Console]::WindowWidth - 1)))
+                            [Console]::Write("`r" + $line.PadRight($drawn))
+                            $drawn = $line.Length
+                            $lastBytes = $bytes
+                        }
+                    }
+                    catch { $showProgress = $false }
+                }
+            }
+            if ($clock.ElapsedMilliseconds -gt 925000) {
+                $process.Kill()
+                $process.WaitForExit()
+                return 28
+            }
         }
         # Drain diagnostics but never echo them: curl errors can contain proxy credentials.
         $null = $stdout.GetAwaiter().GetResult()
@@ -404,7 +454,12 @@ function Invoke-ZigupCurl([string]$Url, [string]$Destination, $Route) {
         }
         return 2
     }
-    finally { $process.Dispose() }
+    finally {
+        if ($drawn -gt 0) {
+            try { [Console]::Write("`r" + (' ' * $drawn) + "`r") } catch {}
+        }
+        $process.Dispose()
+    }
 }
 
 function Test-ZigupDownloadedHash([string]$Path, [string]$ExpectedHash) {
@@ -431,6 +486,7 @@ function Invoke-ZigupDownload(
     [string]$Url,
     [string]$Destination,
     [string]$ExpectedHash = '',
+    [long]$TotalBytes = 0,
     [scriptblock]$Validator = $null,
     [System.Collections.IDictionary]$Environment = [Environment]::GetEnvironmentVariables(),
     [object[]]$SystemSettings = $null,
@@ -460,7 +516,7 @@ function Invoke-ZigupDownload(
         $label = if ([string]::IsNullOrEmpty($route.Proxy)) { 'direct connection' } else { "$($route.Source) proxy" }
         Write-Host "zigup: downloading via $label"
         try {
-            if ($null -eq $Runner) { $code = Invoke-ZigupCurl $Url $temporary $route }
+            if ($null -eq $Runner) { $code = Invoke-ZigupCurl -Url $Url -Destination $temporary -Route $route -TotalBytes $TotalBytes }
             else { $code = & $Runner $Url $temporary $route }
             if ($code -eq 0 -and [IO.File]::Exists($temporary)) {
                 $valid = $ExpectedHash.Length -eq 0 -or (Test-ZigupDownloadedHash $temporary $ExpectedHash)

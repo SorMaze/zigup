@@ -4,7 +4,7 @@ const store_mod = @import("store.zig");
 const Store = store_mod.Store;
 const updater = @import("updater.zig");
 
-const app_version = "0.2.2";
+const app_version = "0.2.3";
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
@@ -93,6 +93,26 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, command, "list")) {
         requireArity(args, 2) catch return fail(stdout, stderr, error.InvalidArguments);
         listVersions(store, stdout) catch |err| return fail(stdout, stderr, err);
+    } else if (std.mem.eql(u8, command, "sweep")) {
+        const result = store.sweep() catch |err| return fail(stdout, stderr, err);
+        if (result.stable) |version| try stdout.print("keeping stable {s}\n", .{version});
+        if (result.dev) |version| try stdout.print("keeping dev {s}\n", .{version});
+        var failed = false;
+        for (result.items) |item| {
+            const kind = @tagName(item.kind);
+            if (item.failure) |err| {
+                failed = true;
+                try stderr.print("zigup: could not remove {s} {s}: {s} ({s})\n", .{ kind, item.name, describeError(err), @errorName(err) });
+            } else {
+                try stdout.print("removed {s} {s}\n", .{ kind, item.name });
+            }
+        }
+        if (result.items.len == 0) try stdout.writeAll("no obsolete Zig versions or archives\n");
+        if (failed) {
+            try stdout.flush();
+            try stderr.flush();
+            std.process.exit(1);
+        }
     } else if (std.mem.eql(u8, command, "remove")) {
         const remove_args = parseRemoveArgs(args) catch return fail(stdout, stderr, error.InvalidArguments);
         const result = store.remove(remove_args.version, .{ .force = remove_args.force }) catch |err| {
@@ -113,32 +133,23 @@ pub fn main(init: std.process.Init) !void {
 
 fn listVersions(store: Store, writer: *Io.Writer) !void {
     try store.ensure();
-    var dir = try Io.Dir.cwd().openDir(store.io, store.versions_dir, .{ .iterate = true });
-    defer dir.close(store.io);
 
     const active = try store.current();
     const active_dev = try store.currentDev();
-    var versions: std.ArrayList([]const u8) = .empty;
+    const versions = try store.registeredVersions();
     defer {
-        for (versions.items) |version| store.allocator.free(version);
-        versions.deinit(store.allocator);
+        for (versions) |version| store.allocator.free(version);
+        store.allocator.free(versions);
     }
-    var iterator = dir.iterate();
-    while (try iterator.next(store.io)) |entry| {
-        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".path")) continue;
-        const version = entry.name[0 .. entry.name.len - ".path".len];
-        if (!store_mod.isValidVersion(version)) continue;
-        try versions.append(store.allocator, try store.allocator.dupe(u8, version));
-    }
-    std.sort.heap([]const u8, versions.items, {}, versionLessThan);
-    for (versions.items) |version| {
+    std.sort.heap([]const u8, versions, {}, versionLessThan);
+    for (versions) |version| {
         const is_active = (active != null and store_mod.versionEqual(active.?, version)) or
             (active_dev != null and store_mod.versionEqual(active_dev.?, version));
         const marker = if (is_active) "*" else " ";
         const incomplete = if (try store.isIncomplete(version)) " [Incomplete]" else "";
         try writer.print("{s} {s}{s}\n", .{ marker, version, incomplete });
     }
-    if (versions.items.len == 0) try writer.writeAll("no registered Zig versions\n");
+    if (versions.len == 0) try writer.writeAll("no registered Zig versions\n");
 }
 
 fn versionLessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
@@ -159,6 +170,7 @@ fn commandArity(command: []const u8) ?usize {
     if (std.mem.eql(u8, command, "home") or
         std.mem.eql(u8, command, "env") or
         std.mem.eql(u8, command, "update") or
+        std.mem.eql(u8, command, "sweep") or
         std.mem.eql(u8, command, "current") or
         std.mem.eql(u8, command, "list")) return 2;
     if (std.mem.eql(u8, command, "use") or
@@ -208,6 +220,7 @@ fn describeError(err: anyerror) []const u8 {
         error.VersionNotFound => "version is not registered",
         error.RemovalAlreadyRunning => "another update or store operation is running; nothing was deleted",
         error.ToolchainInUse => "toolchain is in use; stop running Zig processes and retry",
+        error.ToolchainStillRegistered => "a retained registration points into this toolchain",
         error.ToolchainForceStopFailed => "could not stop every process using the toolchain",
         error.ToolchainProcessInspectionFailed => "could not inspect running processes for toolchain locks",
         error.ToolchainLockInspectionFailed => "could not inspect toolchain file locks; deletion aborted",
@@ -221,6 +234,7 @@ fn describeError(err: anyerror) []const u8 {
         error.InvalidHome => "ZIGUP_HOME cannot be empty",
         error.EntropyUnavailable => "cannot obtain secure randomness for a temporary file",
         error.UnsupportedPlatform => "automatic update currently supports Windows and Linux",
+        error.SweepUnsupported => "sweep currently supports Windows",
         error.UpdateFailed => "automatic update failed; see the updater output above",
         error.UpdateAlreadyRunning => "another zigup update is already running",
         error.InvalidIndex => "the Zig download index is malformed",
@@ -259,6 +273,7 @@ fn printUsage(writer: *Io.Writer) !void {
         \\  zigup list
         \\  zigup use <version>
         \\  zigup update
+        \\  zigup sweep
         \\  zigup current
         \\  zigup where <version>
         \\  zigup remove [-force] <version>
@@ -269,14 +284,18 @@ fn printUsage(writer: *Io.Writer) !void {
         \\`remove` checks for running toolchain processes before deletion. Failures
         \\are retained as [Incomplete]; `remove -force` stops those processes first.
         \\Managed toolchains are deleted; external installations are unregistered.
+        \\`sweep` (Windows) keeps the latest registered stable and dev versions
+        \\and cleans older versions and cached archives.
         \\Downloads automatically select environment/system proxies, then direct.
         \\ZIGUP_PROXY=direct disables proxies; ZIGUP_PROXY=<URL> forces one proxy.
+        \\Downloads show a progress line on a terminal; ZIGUP_NO_PROGRESS=1 hides it.
         \\
     );
 }
 
 test "command arities reject unknown commands" {
     try std.testing.expectEqual(@as(?usize, 2), commandArity("list"));
+    try std.testing.expectEqual(@as(?usize, 2), commandArity("sweep"));
     try std.testing.expectEqual(@as(?usize, 3), commandArity("use"));
     try std.testing.expectEqual(@as(?usize, 4), commandArity("add"));
     try std.testing.expectEqual(@as(?usize, null), commandArity("unknown"));

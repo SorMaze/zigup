@@ -48,6 +48,13 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     }));
+    const progress_tests = b.addRunArtifact(b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/progress.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    }));
     const proxy_module = b.createModule(.{
         .root_source_file = b.path("src/proxy_posix.zig"),
         .target = target,
@@ -59,6 +66,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&store_tests.step);
     test_step.dependOn(&updater_tests.step);
     test_step.dependOn(&posix_updater_tests.step);
+    test_step.dependOn(&progress_tests.step);
     test_step.dependOn(&proxy_tests.step);
 
     if (builtin.os.tag == .windows) {

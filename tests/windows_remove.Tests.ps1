@@ -143,6 +143,85 @@ try {
         Assert-True ($watch.Elapsed.TotalSeconds -lt 5) "$lockName conflict returns immediately"
         $heldFile.Dispose(); $heldFile = $null
     }
+
+    # Run sweep through the CLI against a separate store and exercise numeric
+    # ordering, active selections, cache cleanup, and a retry after a lock.
+    $sweepHome = Join-Path $testRoot 'sweep'
+    $env:ZIGUP_HOME = $sweepHome
+    $stable = '0.10.0'
+    $dev = '0.11.0-dev.10+abc'
+    $oldStable = '0.9.0'
+    $oldDev = '0.11.0-dev.9+def'
+    $olderDev = '0.10.0-dev.100+abc'
+    $downloads = Join-Path $sweepHome 'downloads'
+    [IO.Directory]::CreateDirectory($downloads) | Out-Null
+
+    foreach ($label in @($oldStable, $stable, $oldDev, $dev, $olderDev)) {
+        $dir = Join-Path $sweepHome "toolchains\$label"
+        [IO.Directory]::CreateDirectory($dir) | Out-Null
+        $exe = Join-Path $dir 'zig.exe'
+        [IO.File]::Copy($systemPing, $exe, $false)
+        Assert-True ((Invoke-Zigup @('add', $label, $exe)).Code -eq 0) "register $label for sweep"
+    }
+    Assert-True ((Invoke-Zigup @('use', $oldStable)).Code -eq 0) 'select older stable for sweep'
+    [IO.File]::WriteAllText((Join-Path $sweepHome 'current-dev'), $oldDev.ToUpperInvariant())
+    $external = Join-Path $testRoot 'external-zig.exe'
+    [IO.File]::Copy($systemPing, $external, $false)
+    foreach ($label in @('0.8.0', 'local-build')) {
+        Assert-True ((Invoke-Zigup @('add', $label, $external)).Code -eq 0) "register external $label"
+    }
+    $oldArchives = @("zig-stable-$oldStable.zip", "zig-dev-$oldDev.zip", 'zig-stable-0.7.0.zip')
+    $keepArchives = @("zig-stable-$stable.zip", "zig-dev-$dev.zip", 'zig-stable-0.11.0.zip', 'unrelated.zip')
+    foreach ($name in ($oldArchives + $keepArchives)) {
+        [IO.File]::WriteAllText((Join-Path $downloads $name), 'fixture')
+    }
+
+    $heldFile = [IO.File]::Open((Join-Path $sweepHome 'update.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::ReadWrite)
+    $heldFile.Lock(0, 1)
+    $result = Invoke-Zigup @('sweep')
+    Assert-True ($result.Code -ne 0 -and $result.Output.Contains('RemovalAlreadyRunning')) "sweep respects update lock: $($result.Output)"
+    Assert-True ([IO.File]::Exists((Join-Path $downloads $oldArchives[0]))) 'refused sweep leaves obsolete archive intact'
+    $heldFile.Dispose(); $heldFile = $null
+
+    $lockedExe = Join-Path $sweepHome "toolchains\$oldDev\zig.exe"
+    $heldFile = [IO.File]::Open($lockedExe, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $result = Invoke-Zigup @('sweep')
+    Assert-True ($result.Code -ne 0 -and $result.Output.Contains('ToolchainInUse')) "sweep reports locked old dev: $($result.Output)"
+    Assert-True ([IO.File]::Exists($lockedExe)) 'sweep leaves the locked executable intact'
+    Assert-True ((Invoke-Zigup @('list')).Output.Contains("$oldDev [Incomplete]")) 'sweep marks locked removal for retry'
+    Assert-True (-not [IO.Directory]::Exists((Join-Path $sweepHome "toolchains\$oldStable"))) 'sweep removes older stable despite locked dev'
+    $heldFile.Dispose(); $heldFile = $null
+
+    $result = Invoke-Zigup @('sweep')
+    Assert-True ($result.Code -eq 0) "sweep retries successfully: $($result.Output)"
+    foreach ($label in @($oldDev, $olderDev, '0.8.0')) {
+        Assert-True (-not [IO.File]::Exists((Join-Path $sweepHome "versions\$label.path"))) "sweep unregisters $label"
+    }
+    foreach ($label in @($oldDev, $olderDev)) {
+        Assert-True (-not [IO.Directory]::Exists((Join-Path $sweepHome "toolchains\$label"))) "sweep deletes managed $label"
+    }
+    Assert-True ([IO.File]::Exists($external)) 'sweep preserves the external executable'
+    Assert-True ([IO.File]::Exists((Join-Path $sweepHome 'versions\local-build.path'))) 'sweep preserves custom registrations'
+    foreach ($name in $oldArchives) {
+        Assert-True (-not [IO.File]::Exists((Join-Path $downloads $name))) "sweep deletes cached $name"
+    }
+    foreach ($name in $keepArchives) {
+        Assert-True ([IO.File]::Exists((Join-Path $downloads $name))) "sweep preserves cached $name"
+    }
+    foreach ($channel in @(@('current', 'zig.cmd', $stable), @('current-dev', 'zig-dev.cmd', $dev))) {
+        $exe = Join-Path $sweepHome "toolchains\$($channel[2])\zig.exe"
+        Assert-True ([IO.File]::Exists($exe)) "sweep preserves latest $($channel[2])"
+        Assert-True ([IO.File]::ReadAllText((Join-Path $sweepHome $channel[0])) -eq $channel[2]) "sweep updates $($channel[0])"
+        Assert-True ([IO.File]::ReadAllText((Join-Path $sweepHome "bin\$($channel[1])")).Contains($exe)) "sweep updates $($channel[1])"
+    }
+    $result = Invoke-Zigup @('sweep')
+    Assert-True ($result.Code -eq 0 -and $result.Output.Contains('no obsolete')) 'sweep is idempotent'
+
+    Assert-True ((Invoke-Zigup @('add', '0.20.0', $external)).Code -eq 0) 'register a newer stable for validation'
+    [IO.File]::Delete($external)
+    $result = Invoke-Zigup @('sweep')
+    Assert-True ($result.Code -ne 0) 'sweep refuses to replace a working Zig with a missing executable'
+    Assert-True ([IO.File]::Exists((Join-Path $sweepHome "toolchains\$stable\zig.exe"))) 'sweep preserves working stable when replacement is missing'
 }
 finally {
     if ($null -ne $heldFile) { $heldFile.Dispose() }

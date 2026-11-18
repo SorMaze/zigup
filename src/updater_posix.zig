@@ -117,7 +117,9 @@ fn fetchIndex(ctx: *Context) !std.json.Parsed(std.json.Value) {
     const final_path = try std.fs.path.join(ctx.allocator, &.{ ctx.downloads_dir, "index.json" });
     const partial_path = try uniqueTemporaryPath(ctx, final_path);
     defer Io.Dir.cwd().deleteFile(ctx.io, partial_path) catch {};
-    try download(ctx, index_url, partial_path);
+    // The index has no published size of its own; the transfer renders as an
+    // indeterminate byte counter.
+    try download(ctx, index_url, partial_path, 0);
     try Io.Dir.cwd().rename(partial_path, Io.Dir.cwd(), final_path, ctx.io);
     const bytes = try Io.Dir.cwd().readFileAlloc(
         ctx.io,
@@ -150,6 +152,9 @@ fn installRelease(ctx: *Context, channel: []const u8, release: std.json.Value) !
         },
         else => return error.InvalidIndex,
     };
+    // The index publishes the exact archive size, so the progress line never
+    // needs an extra HEAD request against the download host.
+    const archive_size = assetSize(asset);
 
     if (!std.mem.startsWith(u8, tarball_url, official_url_prefix)) {
         return error.NonOfficialDownloadUrl;
@@ -174,7 +179,7 @@ fn installRelease(ctx: *Context, channel: []const u8, release: std.json.Value) !
         const partial_path = try uniqueTemporaryPath(ctx, archive_path);
         defer Io.Dir.cwd().deleteFile(ctx.io, partial_path) catch {};
         try status(ctx.io, "downloading {s} {s}", .{ channel, version });
-        try download(ctx, tarball_url, partial_path);
+        try download(ctx, tarball_url, partial_path, archive_size);
         try Io.Dir.cwd().rename(partial_path, Io.Dir.cwd(), archive_path, ctx.io);
     }
 
@@ -233,8 +238,22 @@ fn findDownloadTool(ctx: *Context) !?DownloadTool {
     return null;
 }
 
-fn download(ctx: *Context, url: []const u8, output_path: []const u8) !void {
-    try ctx.proxy_session.download(ctx.download_tool, url, output_path);
+fn download(ctx: *Context, url: []const u8, output_path: []const u8, total: u64) !void {
+    try ctx.proxy_session.download(ctx.download_tool, url, output_path, .{ .total = total });
+}
+
+/// Reads the optional `size` field the release index publishes per asset.
+fn assetSize(asset: std.json.Value) u64 {
+    const object = switch (asset) {
+        .object => |obj| obj,
+        else => return 0,
+    };
+    const size = object.get("size") orelse return 0;
+    const text = switch (size) {
+        .string => |s| s,
+        else => return 0,
+    };
+    return std.fmt.parseInt(u64, text, 10) catch 0;
 }
 
 fn extractArchive(io: Io, archive_path: []const u8, dest_dir: []const u8) !void {
@@ -602,4 +621,25 @@ test "profile block quotes shell metacharacters" {
     try std.testing.expect(std.mem.indexOf(u8, block, profile_marker) != null);
     try std.testing.expect(std.mem.indexOf(u8, block, "'/tmp/odd $dir/it'\\''s-bin'") != null);
     try std.testing.expectError(error.PathContainsSeparator, profileBlock(allocator, "/tmp/odd:dir/bin"));
+}
+
+test "asset size reads the published string field and degrades safely" {
+    const allocator = std.testing.allocator;
+    const published = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"version":"1.2.3","size":"97123456","tarball":"https://ziglang.org/x.tar.xz"}
+    ,
+        .{},
+    );
+    defer published.deinit();
+    try std.testing.expectEqual(@as(u64, 97123456), assetSize(published.value));
+
+    const numeric = try std.json.parseFromSlice(std.json.Value, allocator, "{\"size\":42}", .{});
+    defer numeric.deinit();
+    try std.testing.expectEqual(@as(u64, 0), assetSize(numeric.value));
+
+    const absent = try std.json.parseFromSlice(std.json.Value, allocator, "{\"version\":\"1.2.3\"}", .{});
+    defer absent.deinit();
+    try std.testing.expectEqual(@as(u64, 0), assetSize(absent.value));
 }

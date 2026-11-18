@@ -36,14 +36,20 @@ pub const Store = struct {
         if (!isValidVersion(version)) return error.InvalidVersion;
         try self.ensure();
 
-        const absolute = try std.fs.path.resolve(self.allocator, &.{zig_executable});
+        const absolute = try resolveAbsolutePath(self.allocator, self.io, &.{zig_executable});
         const stat = try Io.Dir.cwd().statFile(self.io, absolute, .{});
         try validateExecutable(stat);
 
         var mutation_lock = try self.acquireMutationLock();
         defer mutation_lock.close(self.io);
+        const refresh_stable = if (try self.current()) |active| versionEqual(active, version) else false;
+        const refresh_dev = if (try self.currentDev()) |active| versionEqual(active, version) else false;
         const registration = try self.registrationPath(version);
         try self.replaceFile(registration, absolute, .default_file);
+        // Shims embed executable paths, so replacing an active registration
+        // must refresh every channel that selects it under the same lock.
+        if (refresh_stable) try self.writeShim("zig", absolute);
+        if (refresh_dev) try self.writeShim("zig-dev", absolute);
         try self.clearIncomplete(version);
         return absolute;
     }
@@ -143,6 +149,10 @@ pub const Store = struct {
         var mutation_lock = try self.acquireRemovalLock("store.lock");
         defer mutation_lock.close(self.io);
 
+        return self.removeLocked(version, options);
+    }
+
+    fn removeLocked(self: Store, version: []const u8, options: RemoveOptions) !RemoveResult {
         const registration = try self.registrationPath(version);
         _ = Io.Dir.cwd().statFile(self.io, registration, .{ .follow_symlinks = false }) catch |err| switch (err) {
             error.FileNotFound => return error.VersionNotFound,
@@ -157,6 +167,163 @@ pub const Store = struct {
             self.markIncomplete(version) catch {};
             return err;
         };
+    }
+
+    pub fn registeredVersions(self: Store) ![][]const u8 {
+        var dir = try Io.Dir.cwd().openDir(self.io, self.versions_dir, .{ .iterate = true });
+        defer dir.close(self.io);
+        var versions: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (versions.items) |version| self.allocator.free(version);
+            versions.deinit(self.allocator);
+        }
+        var iterator = dir.iterate();
+        while (try iterator.next(self.io)) |entry| {
+            if (entry.kind != .file) continue;
+            const suffix = ".path";
+            const matches = if (builtin.os.tag == .windows)
+                std.ascii.endsWithIgnoreCase(entry.name, suffix)
+            else
+                std.mem.endsWith(u8, entry.name, suffix);
+            if (!matches) continue;
+            const version = entry.name[0 .. entry.name.len - suffix.len];
+            if (!isValidVersion(version)) continue;
+            try versions.ensureUnusedCapacity(self.allocator, 1);
+            versions.appendAssumeCapacity(try self.allocator.dupe(u8, version));
+        }
+        return versions.toOwnedSlice(self.allocator);
+    }
+
+    pub const SweepItem = struct {
+        kind: enum { version, archive },
+        name: []const u8,
+        failure: ?anyerror = null,
+    };
+
+    pub const SweepResult = struct {
+        stable: ?[]const u8,
+        dev: ?[]const u8,
+        items: []const SweepItem,
+    };
+
+    pub fn sweep(self: Store) !SweepResult {
+        if (builtin.os.tag != .windows) return error.SweepUnsupported;
+        try self.ensure();
+        const update_lock = try self.acquireRemovalLock("update.lock");
+        defer update_lock.close(self.io);
+        const mutation_lock = try self.acquireRemovalLock("store.lock");
+        defer mutation_lock.close(self.io);
+
+        const versions = try self.registeredVersions();
+        var latest = SweepLatest.initFill(null);
+        for (versions) |label| {
+            const version = SweepVersion.parse(label) orelse continue;
+            const slot = latest.getPtr(version.channel);
+            if (slot.* == null or slot.*.?.order(version) == .lt) slot.* = version;
+        }
+
+        var items: std.ArrayList(SweepItem) = .empty;
+        var retained_paths: std.ArrayList([]const u8) = .empty;
+        defer retained_paths.deinit(self.allocator);
+        for (versions) |label| {
+            if (isOlderVersion(label, latest)) {
+                try items.append(self.allocator, .{ .kind = .version, .name = label });
+            } else {
+                const executable = self.readRegistration(label) catch |err| switch (err) {
+                    error.InvalidRegistration => continue,
+                    else => return err,
+                };
+                try retained_paths.append(self.allocator, executable);
+            }
+        }
+        const downloads = try std.fs.path.join(self.allocator, &.{ self.root, "downloads" });
+        try self.collectOldArchives(downloads, latest, &items);
+
+        const stable = if (latest.get(.stable)) |version| version.label else null;
+        const dev = if (latest.get(.dev)) |version| version.label else null;
+        if (items.items.len != 0) {
+            // Resolve both replacements before changing any selections or deleting files.
+            const executables = std.EnumArray(SweepChannel, ?[]const u8).init(.{
+                .stable = if (stable) |label| try self.resolve(label) else null,
+                .dev = if (dev) |label| try self.resolve(label) else null,
+            });
+            const current_stable = try self.current();
+            const current_dev = try self.currentDev();
+            try self.advanceSelection(current_stable, "current", "zig", latest, executables);
+            try self.advanceSelection(current_dev, "current-dev", "zig-dev", latest, executables);
+        }
+
+        for (items.items) |*item| {
+            switch (item.kind) {
+                .version => {
+                    self.sweepVersion(item.name, retained_paths.items) catch |err| {
+                        item.failure = err;
+                    };
+                },
+                .archive => {
+                    const path = try std.fs.path.join(self.allocator, &.{ downloads, item.name });
+                    deleteFileIfExists(self.io, path) catch |err| {
+                        item.failure = err;
+                    };
+                },
+            }
+        }
+        return .{ .stable = stable, .dev = dev, .items = items.items };
+    }
+
+    fn advanceSelection(
+        self: Store,
+        selected: ?[]const u8,
+        current_file: []const u8,
+        shim: []const u8,
+        latest: SweepLatest,
+        executables: std.EnumArray(SweepChannel, ?[]const u8),
+    ) !void {
+        const label = selected orelse return;
+        if (!isOlderVersion(label, latest)) return;
+        const version = SweepVersion.parse(label).?;
+        try self.writeShim(shim, executables.get(version.channel).?);
+        try self.writeCurrentFile(current_file, latest.get(version.channel).?.label);
+    }
+
+    fn sweepVersion(self: Store, version: []const u8, retained_paths: []const []const u8) !void {
+        const executable = try self.readRegistration(version);
+        if (try self.managedToolchainPath(version, executable)) |toolchain| {
+            for (retained_paths) |path| {
+                if (path.len > toolchain.len and std.fs.path.isSep(path[toolchain.len]) and
+                    pathEqual(path[0..toolchain.len], toolchain)) return error.ToolchainStillRegistered;
+            }
+        }
+        _ = try self.removeLocked(version, .{});
+    }
+
+    fn collectOldArchives(
+        self: Store,
+        downloads: []const u8,
+        latest: SweepLatest,
+        items: *std.ArrayList(SweepItem),
+    ) !void {
+        var dir = Io.Dir.cwd().openDir(self.io, downloads, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer dir.close(self.io);
+        var iterator = dir.iterate();
+        while (try iterator.next(self.io)) |entry| {
+            if (entry.kind != .file or !std.ascii.endsWithIgnoreCase(entry.name, ".zip")) continue;
+            const base = entry.name[0 .. entry.name.len - ".zip".len];
+            const channel: SweepChannel, const prefix: []const u8 =
+                if (std.ascii.startsWithIgnoreCase(base, "zig-stable-"))
+                    .{ .stable, "zig-stable-" }
+                else if (std.ascii.startsWithIgnoreCase(base, "zig-dev-"))
+                    .{ .dev, "zig-dev-" }
+                else
+                    continue;
+            const version = SweepVersion.parse(base[prefix.len..]) orelse continue;
+            if (version.channel != channel or !isOlderVersion(version.label, latest)) continue;
+            try items.ensureUnusedCapacity(self.allocator, 1);
+            items.appendAssumeCapacity(.{ .kind = .archive, .name = try self.allocator.dupe(u8, entry.name) });
+        }
     }
 
     fn removeMarked(
@@ -384,6 +551,50 @@ pub const Store = struct {
     }
 };
 
+const SweepChannel = enum { stable, dev };
+const SweepLatest = std.EnumArray(SweepChannel, ?SweepVersion);
+
+const SweepVersion = struct {
+    label: []const u8,
+    base: std.SemanticVersion,
+    channel: SweepChannel,
+    revision: ?usize = null,
+
+    fn parse(label: []const u8) ?SweepVersion {
+        if (!isValidVersion(label)) return null;
+        var base = std.SemanticVersion.parse(label) catch return null;
+        const pre = base.pre orelse {
+            if (base.build != null) return null;
+            return .{ .label = label, .base = base, .channel = .stable };
+        };
+        base.pre = null;
+        const revision = if (std.ascii.eqlIgnoreCase(pre, "dev"))
+            null
+        else if (std.ascii.startsWithIgnoreCase(pre, "dev."))
+            std.fmt.parseUnsigned(usize, pre["dev.".len..], 10) catch return null
+        else
+            return null;
+        return .{ .label = label, .base = base, .channel = .dev, .revision = revision };
+    }
+
+    fn order(lhs: SweepVersion, rhs: SweepVersion) std.math.Order {
+        const precedence = lhs.base.order(rhs.base);
+        if (precedence != .eq) return precedence;
+        if (lhs.revision != rhs.revision) {
+            const left = lhs.revision orelse return .lt;
+            const right = rhs.revision orelse return .gt;
+            return std.math.order(left, right);
+        }
+        return std.ascii.orderIgnoreCase(lhs.label, rhs.label);
+    }
+};
+
+fn isOlderVersion(label: []const u8, latest: SweepLatest) bool {
+    const version = SweepVersion.parse(label) orelse return false;
+    const newest = latest.get(version.channel) orelse return false;
+    return version.order(newest) == .lt;
+}
+
 fn deleteFileIfExists(io: Io, path: []const u8) !void {
     Io.Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
         error.FileNotFound => {},
@@ -549,6 +760,109 @@ test "Windows command shim escaping doubles environment expansion markers" {
     const escaped = try escapeCmdPercent(allocator, "C:\\odd%PATH%\\zig.exe");
     defer allocator.free(escaped);
     try std.testing.expectEqualStrings("C:\\odd%%PATH%%\\zig.exe", escaped);
+}
+
+test "add resolves relative executables before persisting registrations" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const store: Store = .{
+        .allocator = allocator,
+        .io = io,
+        .root = root,
+        .versions_dir = try std.fs.path.join(allocator, &.{ root, "versions" }),
+        .bin_dir = try std.fs.path.join(allocator, &.{ root, "bin" }),
+    };
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "test-zig",
+        .data = "test executable",
+        .flags = .{ .permissions = .executable_file },
+    });
+    const executable = try std.fs.path.join(allocator, &.{ root, "test-zig" });
+    var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_len = try std.process.currentPath(io, &cwd_buffer);
+    const cwd = cwd_buffer[0..cwd_len];
+    const relative = try std.fs.path.relative(allocator, cwd, null, cwd, executable);
+    try std.testing.expect(!std.fs.path.isAbsolute(relative));
+
+    const registered = try store.add("1.2.3", relative);
+    try std.testing.expect(std.fs.path.isAbsolute(registered));
+    try std.testing.expectEqualStrings(executable, registered);
+    try std.testing.expectEqualStrings(executable, try store.resolve("1.2.3"));
+    try std.testing.expectEqualStrings(executable, try store.use("1.2.3"));
+}
+
+test "re-registering a version refreshes only channels selecting that version" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const store: Store = .{
+        .allocator = allocator,
+        .io = io,
+        .root = root,
+        .versions_dir = try std.fs.path.join(allocator, &.{ root, "versions" }),
+        .bin_dir = try std.fs.path.join(allocator, &.{ root, "bin" }),
+    };
+    for ([_][]const u8{ "old-zig", "new-zig" }) |name| {
+        try tmp.dir.writeFile(io, .{
+            .sub_path = name,
+            .data = "test executable",
+            .flags = .{ .permissions = .executable_file },
+        });
+    }
+    const old_executable = try std.fs.path.join(allocator, &.{ root, "old-zig" });
+    const new_executable = try std.fs.path.join(allocator, &.{ root, "new-zig" });
+    const stable_shim = try std.fs.path.join(allocator, &.{ store.bin_dir, if (builtin.os.tag == .windows) "zig.cmd" else "zig" });
+    const dev_shim = try std.fs.path.join(allocator, &.{ store.bin_dir, if (builtin.os.tag == .windows) "zig-dev.cmd" else "zig-dev" });
+    const version = "1.2.3-RC1";
+    const reregistered_version = if (builtin.os.tag == .windows) "1.2.3-rc1" else version;
+    _ = try store.add(version, old_executable);
+    try std.testing.expect((try store.current()) == null);
+    try std.testing.expect((try store.currentDev()) == null);
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, stable_shim, .{}));
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, dev_shim, .{}));
+    _ = try store.use(version);
+    _ = try store.useDev(version);
+    _ = try store.add(reregistered_version, new_executable);
+    try std.testing.expectEqualStrings(new_executable, try store.resolve(version));
+    try std.testing.expectEqualStrings(version, (try store.current()).?);
+    try std.testing.expectEqualStrings(version, (try store.currentDev()).?);
+    for ([_][]const u8{ stable_shim, dev_shim }) |shim| {
+        const contents = try Io.Dir.cwd().readFileAlloc(io, shim, allocator, .limited(64 * 1024));
+        try std.testing.expect(std.mem.indexOf(u8, contents, "new-zig") != null);
+        try std.testing.expect(std.mem.indexOf(u8, contents, "old-zig") == null);
+    }
+
+    // Replacing an inactive registration must leave both active shims alone.
+    const stable_before = try Io.Dir.cwd().readFileAlloc(io, stable_shim, allocator, .limited(64 * 1024));
+    const dev_before = try Io.Dir.cwd().readFileAlloc(io, dev_shim, allocator, .limited(64 * 1024));
+    _ = try store.add("2.0.0", old_executable);
+    _ = try store.add("2.0.0", new_executable);
+    try std.testing.expectEqualStrings(stable_before, try Io.Dir.cwd().readFileAlloc(io, stable_shim, allocator, .limited(64 * 1024)));
+    try std.testing.expectEqualStrings(dev_before, try Io.Dir.cwd().readFileAlloc(io, dev_shim, allocator, .limited(64 * 1024)));
+    _ = try store.useDev("2.0.0");
+    _ = try store.add("2.0.0", old_executable);
+    const stable_after = try Io.Dir.cwd().readFileAlloc(io, stable_shim, allocator, .limited(64 * 1024));
+    const dev_after = try Io.Dir.cwd().readFileAlloc(io, dev_shim, allocator, .limited(64 * 1024));
+    try std.testing.expectEqualStrings(stable_before, stable_after);
+    try std.testing.expect(std.mem.indexOf(u8, dev_after, "old-zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dev_after, "new-zig") == null);
+    try std.testing.expectEqualStrings(version, (try store.current()).?);
+    try std.testing.expectEqualStrings("2.0.0", (try store.currentDev()).?);
 }
 
 test "remove deletes historical registrations and safely clears active channels" {

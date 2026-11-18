@@ -168,4 +168,13 @@ finally {
     }
     [IO.Directory]::Delete($resolved, $true)
 }
+Assert-Equal (Format-ZigupProgressLine 10485760 20971520 2) ' 50% [============>-----------] 10.0/20.0 MiB 5.0 MiB/s' 'progress line'
+Assert-Equal (Format-ZigupProgressLine 20971520 20971520 4) '100% [========================] 20.0/20.0 MiB 5.0 MiB/s' 'progress line completes at 100 percent'
+Assert-Equal (Format-ZigupProgressLine 3145728 0 1) '  3.0 MiB  3.0 MiB/s' 'progress line without a known size'
+Assert-Equal (Format-ZigupProgressLine 0 20971520 0) '  0% [>-----------------------] 0.0/20.0 MiB 0.0 MiB/s' 'progress line tolerates a zero clock'
+$env:ZIGUP_NO_PROGRESS = '1'
+Assert-Equal (Test-ZigupProgressEnabled) $false 'ZIGUP_NO_PROGRESS disables progress'
+$env:ZIGUP_NO_PROGRESS = 'off'
+Assert-Equal (Test-ZigupProgressEnabled) (-not [Console]::IsOutputRedirected) 'false-like value keeps progress'
+Remove-Item Env:ZIGUP_NO_PROGRESS -ErrorAction SilentlyContinue
 Write-Host "Windows proxy unit tests passed: $script:Assertions assertions"

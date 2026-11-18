@@ -59,6 +59,14 @@ that entry manually; zigup will not move or replace a shared directory.
 ## Commands
 
 - `zigup update` installs the latest official stable and `master` dev releases.
+- `zigup sweep` (Windows) keeps the newest registered stable release and the
+  newest registered development build, then removes older versions and cached
+  ZIPs. It compares version numbers locally. If a command shim selects an older
+  version, sweep switches it to the newest version of the same kind. Custom
+  labels such as `local-build` and release candidates are preserved. Older
+  external installations are unregistered. If a managed toolchain is in use,
+  sweep reports it and continues cleaning the other versions. Run sweep again
+  after the toolchain is idle.
 - `zigup add <version> <zig-executable>` registers an existing installation.
 - `zigup list` lists registered versions and marks the active one.
 - `zigup use <version>` selects a version and regenerates the shim.
@@ -83,6 +91,23 @@ that entry manually; zigup will not move or replace a shared directory.
 Set `ZIGUP_HOME` to override the default data directory. The default is
 `%LOCALAPPDATA%\zigup` on Windows, `$XDG_DATA_HOME/zigup` when available on
 Unix-like systems, or `$HOME/.local/share/zigup` otherwise.
+
+## Download progress
+
+`zigup update` draws a progress bar while an archive downloads:
+
+```text
+ 58% [=============>----------] 24.1/41.7 MiB 3.2 MiB/s
+```
+
+The expected size comes from the `size` field published in the official
+release index, so rendering costs no extra request. The line is redrawn in
+place and erased before the next status message. It appears only when standard
+output is a terminal, so redirected and piped output stays free of control
+characters. Set `ZIGUP_NO_PROGRESS=1` to hide it in a terminal as well.
+
+Progress is measured from the growing archive file. Downloader diagnostics
+can contain proxy credentials and are kept out of terminal output.
 
 ## Automatic proxy selection
 
